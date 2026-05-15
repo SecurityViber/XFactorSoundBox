@@ -1,62 +1,77 @@
 /**
- * XFactor SoundBox — DFPlayer Mini Controller
+ * XFactor SoundBox — DFPlayer Mini + PIR Controller
  *
  * Target:  Seeed Studio XIAO ESP32-S3
  * Library: DFRobotDFPlayerMini (declared in platformio.ini lib_deps)
  *
- * Wiring:
+ * DFPlayer wiring:
  *   XIAO GPIO 43 (D6 / TX) ──── 1 kΩ ──── DFPlayer RX
  *   XIAO GPIO 44 (D7 / RX) ────────────── DFPlayer TX
  *   XIAO GND               ────────────── DFPlayer GND
  *   DFPlayer VCC            ────────────── 3.3 V or 5 V (module accepts both)
  *
- * SD card layout expected on DFPlayer:
- *   /mp3/0001.mp3   ← played on boot
- *        0002.mp3
- *        ...
+ * PIR sensor BS412 (4-pin radial, bottom view):
+ *   Pin 1 (VSS)    ──── XIAO GND
+ *   Pin 2 (ONTIME) ──── GND via 0 Ω  (on-time = 2 s min, datasheet §2 row 0)
+ *   Pin 3 (VDD)    ──── XIAO 3.3 V
+ *   Pin 4 (REL)    ──── XIAO GPIO 6 (D6)   ← HIGH when motion detected
+ *   No pull-up needed — REL is a push-pull Schmitt trigger output.
  *
- * Note: Use myDFPlayer.playMp3Folder(n) to play /mp3/000n.mp3.
- *       playFolder(15, n) looks for a folder literally named "15" — it does
- *       NOT address the special /mp3/ folder.
+ * SD card layout expected on DFPlayer:
+ *   /mp3/0001.mp3
+ *        0002.mp3
+ *        0003.mp3
+ *
+ * PIR detection note:
+ *   BS412 output is polled every loop iteration (~1–3 ms).
+ *   Rising-edge detection fires once per event.
+ *   With ONTIME tied to GND, the output stays HIGH for ≥2 s,
+ *   so the minimum re-trigger interval is ~2 s.
+ *
+ * Behaviour:
+ *   Audio plays ONLY when the PIR detects motion. Each trigger
+ *   advances to the next track (1 → 2 → 3 → 1 → …). If a track
+ *   is already playing when motion is detected it restarts from
+ *   the next track immediately.
  */
 
 #include <Arduino.h>
 #include <DFRobotDFPlayerMini.h>
 
-// ── Pin & Serial Configuration ───────────────────────────────────────────────
-// Named from the XIAO's perspective (matching the silk-screen labels):
-//   XIAO TX = GPIO43 / D6  → transmits to DFPlayer RX (via 1 kΩ resistor)
-//   XIAO RX = GPIO44 / D7  ← receives from DFPlayer TX
+// ── Pin Configuration ─────────────────────────────────────────────────────────
 
-static constexpr int  XIAO_UART_TX = 43;   // GPIO43 | D6 | TX  →  DFPlayer RX
-static constexpr int  XIAO_UART_RX = 44;   // GPIO44 | D7 | RX  ←  DFPlayer TX
-static constexpr long DEBUG_BAUD      = 115200;
-static constexpr long DFPLAYER_BAUD   = 9600;
+static constexpr int XIAO_UART_TX = 43;  // GPIO43 | TX  →  DFPlayer RX
+static constexpr int XIAO_UART_RX = 44;  // GPIO44 | RX  ←  DFPlayer TX
+static constexpr int PIR_PIN      = 6;   // GPIO6         ←  BS412 REL (HIGH = motion)
+
+// ── Serial Configuration ──────────────────────────────────────────────────────
+
+static constexpr long DEBUG_BAUD    = 115200;
+static constexpr long DFPLAYER_BAUD = 9600;
 
 // ── Audio Configuration ───────────────────────────────────────────────────────
 
-static constexpr uint8_t  VOLUME_LEVEL       = 20;      // 0 – 30
-static constexpr uint8_t  START_TRACK        = 1;
-static constexpr uint32_t TRACK_INTERVAL_MS  = 8000UL;  // advance to next track every 8 s
+static constexpr uint8_t  VOLUME_LEVEL    = 15;      // 0 – 30
+static constexpr uint8_t  TOTAL_TRACKS   = 3;       // fallback if SD query fails
+static constexpr uint32_t PLAY_DURATION_MS = 3000UL; // stop playback after this many ms
 
 // ── Objects ───────────────────────────────────────────────────────────────────
 
-// UART1 keeps USB Serial (UART0) free for the debug monitor.
-HardwareSerial      dfPlayerSerial(1);
+HardwareSerial      dfPlayerSerial(1);  // UART1 — leaves USB Serial free for debug
 DFRobotDFPlayerMini myDFPlayer;
 
-// ── Module State ─────────────────────────────────────────────────────────────
+// ── Module State ──────────────────────────────────────────────────────────────
 
-static bool     dfPlayerReady  = false;
-static uint8_t  totalTracks    = 2;
-static uint8_t  currentTrack   = START_TRACK;
-static uint32_t lastTrackMs    = 0;    // millis() timestamp of the last playFolder() call
-static uint32_t ledOffMs       = 0;    // millis() timestamp when LED should turn off
+static bool     dfPlayerReady = false;
+static uint8_t  totalTracks   = TOTAL_TRACKS;  // overwritten in setup() from SD card
+
+static bool     pirLastLevel  = false;  // previous REL level for rising-edge detection
+static bool     isPlaying     = false;
+static uint32_t playStartMs   = 0;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // printDFPlayerDetail()
 //   Decodes and logs the asynchronous status messages sent by the DFPlayer.
-//   Call this whenever myDFPlayer.available() returns true.
 // ─────────────────────────────────────────────────────────────────────────────
 static void printDFPlayerDetail(uint8_t type, int value) {
     switch (type) {
@@ -66,23 +81,13 @@ static void printDFPlayerDetail(uint8_t type, int value) {
         case WrongStack:
             Serial.println(F("[DFPlayer] Stack error — check wiring/baud rate."));
             break;
-        case DFPlayerCardInserted:
-            Serial.println(F("[DFPlayer] SD card inserted."));
-            break;
-        case DFPlayerCardRemoved:
-            Serial.println(F("[DFPlayer] SD card removed."));
-            break;
-        case DFPlayerCardOnline:
-            Serial.println(F("[DFPlayer] SD card online."));
-            break;
-        case DFPlayerUSBInserted:
-            Serial.println(F("[DFPlayer] USB storage inserted."));
-            break;
-        case DFPlayerUSBRemoved:
-            Serial.println(F("[DFPlayer] USB storage removed."));
-            break;
+        case DFPlayerCardInserted:   Serial.println(F("[DFPlayer] SD card inserted."));    break;
+        case DFPlayerCardRemoved:    Serial.println(F("[DFPlayer] SD card removed."));     break;
+        case DFPlayerCardOnline:     Serial.println(F("[DFPlayer] SD card online."));      break;
+        case DFPlayerUSBInserted:    Serial.println(F("[DFPlayer] USB inserted."));        break;
+        case DFPlayerUSBRemoved:     Serial.println(F("[DFPlayer] USB removed."));         break;
         case DFPlayerPlayFinished:
-            Serial.print(F("[DFPlayer] Playback finished — Folder: "));
+            Serial.print(F("[DFPlayer] Finished — Folder: "));
             Serial.print(value >> 8);
             Serial.print(F(", Track: "));
             Serial.println(value & 0xFF);
@@ -90,14 +95,14 @@ static void printDFPlayerDetail(uint8_t type, int value) {
         case DFPlayerError:
             Serial.print(F("[DFPlayer] Runtime error: "));
             switch (value) {
-                case Busy:             Serial.println(F("Busy / no SD card."));           break;
-                case Sleeping:         Serial.println(F("Module is sleeping."));           break;
-                case SerialWrongStack: Serial.println(F("Serial framing error."));         break;
-                case CheckSumNotMatch: Serial.println(F("Checksum mismatch."));            break;
-                case FileIndexOut:     Serial.println(F("File index out of bounds."));     break;
-                case FileMismatch:     Serial.println(F("File not found on SD card."));    break;
-                case Advertise:        Serial.println(F("Advertise mode active."));        break;
-                default:               Serial.println(F("Unknown error code."));           break;
+                case Busy:             Serial.println(F("Busy / no SD card."));          break;
+                case Sleeping:         Serial.println(F("Module sleeping."));             break;
+                case SerialWrongStack: Serial.println(F("Serial framing error."));        break;
+                case CheckSumNotMatch: Serial.println(F("Checksum mismatch."));           break;
+                case FileIndexOut:     Serial.println(F("File index out of bounds."));    break;
+                case FileMismatch:     Serial.println(F("File not found on SD card."));   break;
+                case Advertise:        Serial.println(F("Advertise mode active."));       break;
+                default:               Serial.println(F("Unknown error code."));          break;
             }
             break;
         default:
@@ -105,21 +110,13 @@ static void printDFPlayerDetail(uint8_t type, int value) {
     }
 }
 
-static void triggerLedBlink() {
-    digitalWrite(LED_BUILTIN, HIGH);
-    ledOffMs = millis() + 200;
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // initDFPlayer()
-//   Blocks until the DFPlayer responds or halts with diagnostic output.
 // ─────────────────────────────────────────────────────────────────────────────
 static bool initDFPlayer() {
     Serial.println(F("[Init] Starting DFPlayer Mini..."));
 
-    // isACK=false → skip ACK handshake; required for most clone modules
-    // doReset=false → don't reset; avoids ~1-2 s delay and clone incompatibilities
-    if (!myDFPlayer.begin(dfPlayerSerial, /*isACK=*/false, /*doReset=*/false)) {
+    if (!myDFPlayer.begin(dfPlayerSerial, /*isACK=*/true, /*doReset=*/true)) {
         Serial.println(F(""));
         Serial.println(F("══════════════════════════════════════════════════"));
         Serial.println(F("  [FATAL] DFPlayer Mini did not respond!"));
@@ -145,7 +142,6 @@ static bool initDFPlayer() {
 // setup()
 // ─────────────────────────────────────────────────────────────────────────────
 void setup() {
-    // USB debug serial — wait up to 3 s for a host to attach.
     Serial.begin(DEBUG_BAUD);
     const uint32_t bootWaitMs = millis() + 3000UL;
     while (!Serial && millis() < bootWaitMs) { /* spin */ }
@@ -155,8 +151,9 @@ void setup() {
     Serial.println(F("║   XFactor SoundBox — Booting…   ║"));
     Serial.println(F("╚══════════════════════════════════╝"));
 
-    pinMode(LED_BUILTIN, OUTPUT);
-    digitalWrite(LED_BUILTIN, LOW);
+    // PIR input — push-pull output, no internal pull-up needed
+    pinMode(PIR_PIN, INPUT);
+    pirLastLevel = digitalRead(PIR_PIN);
 
     // UART1: begin(baud, config, rxPin, txPin)
     dfPlayerSerial.begin(DFPLAYER_BAUD, SERIAL_8N1, XIAO_UART_RX, XIAO_UART_TX);
@@ -165,41 +162,39 @@ void setup() {
     delay(1000);
 
     if (!initDFPlayer()) {
-        Serial.println(F("[Init] Continuing anyway — module may still respond."));
+        while (true) { delay(1000); }  // halt — no point continuing without audio
     }
 
-    // ── Audio settings ───────────────────────────────────────────────────────
-    myDFPlayer.setTimeOut(500);                    // ms before a command times out
-    myDFPlayer.outputDevice(DFPLAYER_DEVICE_SD);   // source: SD card
+    myDFPlayer.setTimeOut(500);
+    myDFPlayer.outputDevice(DFPLAYER_DEVICE_SD);
     myDFPlayer.EQ(DFPLAYER_EQ_NORMAL);
-    myDFPlayer.volume(VOLUME_LEVEL);               // 0–30
+    myDFPlayer.volume(VOLUME_LEVEL);
 
     Serial.print(F("[Audio] Volume: "));
     Serial.print(VOLUME_LEVEL);
-    Serial.println(F(" / 30"));
-    Serial.println(F("[Audio] EQ: Normal"));
+    Serial.println(F(" / 30  |  EQ: Normal"));
 
-    // ── Initial playback — fires immediately on boot ─────────────────────────
-    // playMp3Folder(n) plays /mp3/000n.mp3 — the correct command for the
-    // special /mp3/ folder. playFolder(15, n) looks for a folder named "15"
-    // and does NOT address /mp3/.
-    currentTrack = START_TRACK;
-    Serial.print(F("[Audio] Playing /mp3/000"));
-    Serial.print(currentTrack);
-    Serial.println(F(".mp3"));
+    int count = myDFPlayer.readFileCountsInFolder(15);  // /mp3/ folder = ID 15
+    if (count > 0 && count <= 255) {
+        totalTracks = static_cast<uint8_t>(count);
+    } else {
+        Serial.print(F("[Audio] Warning: could not read track count — defaulting to "));
+        Serial.print(TOTAL_TRACKS);
+        Serial.println(F("."));
+        totalTracks = TOTAL_TRACKS;
+    }
+    Serial.print(F("[Audio] Tracks in /mp3/: "));
+    Serial.println(totalTracks);
 
-    myDFPlayer.playMp3Folder(currentTrack);
-    triggerLedBlink();
-    lastTrackMs = millis();   // start the 3 s countdown from now
+    // Seed with ESP32 hardware RNG for true randomness on every boot
+    randomSeed(esp_random());
 
+    Serial.println(F("[Init] Waiting for motion…\n"));
     dfPlayerReady = true;
-    Serial.println(F("[Init] Setup complete.\n"));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// loop() — non-blocking
-//   Structure is intentionally flat so touch/button handlers can be added
-//   without restructuring around a blocking delay.
+// loop() — fully non-blocking
 // ─────────────────────────────────────────────────────────────────────────────
 void loop() {
     // ── 1. Poll DFPlayer for async status / error messages ───────────────────
@@ -207,50 +202,26 @@ void loop() {
         printDFPlayerDetail(myDFPlayer.readType(), myDFPlayer.read());
     }
 
-    // ── 2. Auto-advance: play next track every TRACK_INTERVAL_MS, wrap to 1 ──
-    if (dfPlayerReady) {
-        uint32_t now = millis();
-        if (now - lastTrackMs >= TRACK_INTERVAL_MS) {
-            lastTrackMs = now;
-            currentTrack = (currentTrack % totalTracks) + 1;  // 1→2→…→N→1
-
-            Serial.print(F("[Audio] Auto-advance → track "));
-            Serial.print(currentTrack);
-            Serial.print(F(" / "));
-            Serial.println(totalTracks);
-
-            myDFPlayer.playMp3Folder(currentTrack);
-            triggerLedBlink();
-        }
+    // ── 2. Auto-stop after PLAY_DURATION_MS ──────────────────────────────────
+    if (isPlaying && (millis() - playStartMs >= PLAY_DURATION_MS)) {
+        myDFPlayer.stop();
+        isPlaying = false;
+        Serial.println(F("[Audio] Stopped after 3 s."));
     }
 
-    // ── LED blink off ────────────────────────────────────────────────────────
-    if (ledOffMs > 0 && millis() >= ledOffMs) {
-        digitalWrite(LED_BUILTIN, LOW);
-        ledOffMs = 0;
+    // ── 3. PIR — play a random track on rising edge (LOW → HIGH) ─────────────
+    bool pirLevel = digitalRead(PIR_PIN);
+    if (pirLevel && !pirLastLevel && dfPlayerReady) {
+        uint8_t track = random(1, totalTracks + 1);  // inclusive range [1, totalTracks]
+
+        Serial.print(F("[PIR] Motion detected — playing random track "));
+        Serial.print(track);
+        Serial.print(F(" / "));
+        Serial.println(totalTracks);
+
+        myDFPlayer.playMp3Folder(track);
+        playStartMs = millis();
+        isPlaying   = true;
     }
-
-    // ── 3. Touch input — expand here when hardware is connected ──────────────
-    //
-    // Example (XIAO ESP32-S3 touch-capable pins: GPIO 1–5, 7–9, etc.):
-    //
-    // static uint32_t lastTouchMs = 0;
-    // static constexpr uint32_t DEBOUNCE_MS     = 80;
-    // static constexpr int      TOUCH_THRESHOLD = 40000; // tune per pad
-    //
-    // uint32_t now = millis();
-    // if ((now - lastTouchMs) > DEBOUNCE_MS) {
-    //     if (touchRead(T1) < TOUCH_THRESHOLD) {  // T1 = GPIO 1
-    //         lastTouchMs = now;
-    //         myDFPlayer.next();
-    //         Serial.println(F("[Input] Touch T1 — next track."));
-    //     }
-    //     if (touchRead(T2) < TOUCH_THRESHOLD) {  // T2 = GPIO 2
-    //         lastTouchMs = now;
-    //         myDFPlayer.previous();
-    //         Serial.println(F("[Input] Touch T2 — previous track."));
-    //     }
-    // }
-
-    // ── 4. Other non-blocking tasks go here ──────────────────────────────────
+    pirLastLevel = pirLevel;
 }
