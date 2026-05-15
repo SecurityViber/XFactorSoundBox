@@ -15,10 +15,9 @@
  *        0002.mp3
  *        ...
  *
- * Note: The /mp3/ folder is addressed as folder 15 in the DFPlayer
- *       protocol.  If your files live in a numerically-named folder
- *       (e.g. /15/), use playFolder(15, 1).  If the folder is literally
- *       named "mp3", prefer myDFPlayer.playMp3Folder(1) instead.
+ * Note: Use myDFPlayer.playMp3Folder(n) to play /mp3/000n.mp3.
+ *       playFolder(15, n) looks for a folder literally named "15" — it does
+ *       NOT address the special /mp3/ folder.
  */
 
 #include <Arduino.h>
@@ -36,10 +35,9 @@ static constexpr long DFPLAYER_BAUD   = 9600;
 
 // ── Audio Configuration ───────────────────────────────────────────────────────
 
-static constexpr uint8_t  VOLUME_LEVEL       = 15;      // 0 – 30
-static constexpr uint8_t  START_FOLDER       = 15;      // DFPlayer internal ID for /mp3/ folder
+static constexpr uint8_t  VOLUME_LEVEL       = 20;      // 0 – 30
 static constexpr uint8_t  START_TRACK        = 1;
-static constexpr uint32_t TRACK_INTERVAL_MS  = 3000UL;  // advance to next track every 3 s
+static constexpr uint32_t TRACK_INTERVAL_MS  = 8000UL;  // advance to next track every 8 s
 
 // ── Objects ───────────────────────────────────────────────────────────────────
 
@@ -50,9 +48,10 @@ DFRobotDFPlayerMini myDFPlayer;
 // ── Module State ─────────────────────────────────────────────────────────────
 
 static bool     dfPlayerReady  = false;
-static uint8_t  totalTracks    = 1;    // populated in setup() from SD card; safe default = 1
+static uint8_t  totalTracks    = 2;
 static uint8_t  currentTrack   = START_TRACK;
 static uint32_t lastTrackMs    = 0;    // millis() timestamp of the last playFolder() call
+static uint32_t ledOffMs       = 0;    // millis() timestamp when LED should turn off
 
 // ─────────────────────────────────────────────────────────────────────────────
 // printDFPlayerDetail()
@@ -106,6 +105,11 @@ static void printDFPlayerDetail(uint8_t type, int value) {
     }
 }
 
+static void triggerLedBlink() {
+    digitalWrite(LED_BUILTIN, HIGH);
+    ledOffMs = millis() + 200;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // initDFPlayer()
 //   Blocks until the DFPlayer responds or halts with diagnostic output.
@@ -113,9 +117,9 @@ static void printDFPlayerDetail(uint8_t type, int value) {
 static bool initDFPlayer() {
     Serial.println(F("[Init] Starting DFPlayer Mini..."));
 
-    // isACK=true  → wait for hardware acknowledge on each command (reliable)
-    // doReset=true → send a soft-reset so the module is in a known state
-    if (!myDFPlayer.begin(dfPlayerSerial, /*isACK=*/true, /*doReset=*/true)) {
+    // isACK=false → skip ACK handshake; required for most clone modules
+    // doReset=false → don't reset; avoids ~1-2 s delay and clone incompatibilities
+    if (!myDFPlayer.begin(dfPlayerSerial, /*isACK=*/false, /*doReset=*/false)) {
         Serial.println(F(""));
         Serial.println(F("══════════════════════════════════════════════════"));
         Serial.println(F("  [FATAL] DFPlayer Mini did not respond!"));
@@ -151,6 +155,9 @@ void setup() {
     Serial.println(F("║   XFactor SoundBox — Booting…   ║"));
     Serial.println(F("╚══════════════════════════════════╝"));
 
+    pinMode(LED_BUILTIN, OUTPUT);
+    digitalWrite(LED_BUILTIN, LOW);
+
     // UART1: begin(baud, config, rxPin, txPin)
     dfPlayerSerial.begin(DFPLAYER_BAUD, SERIAL_8N1, XIAO_UART_RX, XIAO_UART_TX);
 
@@ -158,8 +165,7 @@ void setup() {
     delay(1000);
 
     if (!initDFPlayer()) {
-        // No audio hardware — park here so the serial log stays readable.
-        while (true) { delay(1000); }
+        Serial.println(F("[Init] Continuing anyway — module may still respond."));
     }
 
     // ── Audio settings ───────────────────────────────────────────────────────
@@ -173,29 +179,17 @@ void setup() {
     Serial.println(F(" / 30"));
     Serial.println(F("[Audio] EQ: Normal"));
 
-    // ── Query track count so the auto-advance can wrap correctly ────────────
-    // readFileCountsInFolder() returns int; -1 signals an error.
-    int count = myDFPlayer.readFileCountsInFolder(START_FOLDER);
-    if (count > 0 && count <= 255) {
-        totalTracks = static_cast<uint8_t>(count);
-    } else {
-        Serial.println(F("[Audio] Warning: could not read track count — defaulting to 1."));
-        totalTracks = 1;
-    }
-    Serial.print(F("[Audio] Tracks found in folder: "));
-    Serial.println(totalTracks);
-
     // ── Initial playback — fires immediately on boot ─────────────────────────
-    // Plays /mp3/0001.mp3 (DFPlayer protocol: folder 15, track 1).
-    // If your folder is literally named "mp3" and the above doesn't work,
-    // replace with: myDFPlayer.playMp3Folder(START_TRACK);
+    // playMp3Folder(n) plays /mp3/000n.mp3 — the correct command for the
+    // special /mp3/ folder. playFolder(15, n) looks for a folder named "15"
+    // and does NOT address /mp3/.
     currentTrack = START_TRACK;
-    Serial.print(F("[Audio] Playing folder "));
-    Serial.print(START_FOLDER);
-    Serial.print(F(", track "));
-    Serial.println(currentTrack);
+    Serial.print(F("[Audio] Playing /mp3/000"));
+    Serial.print(currentTrack);
+    Serial.println(F(".mp3"));
 
-    myDFPlayer.playFolder(START_FOLDER, currentTrack);
+    myDFPlayer.playMp3Folder(currentTrack);
+    triggerLedBlink();
     lastTrackMs = millis();   // start the 3 s countdown from now
 
     dfPlayerReady = true;
@@ -225,8 +219,15 @@ void loop() {
             Serial.print(F(" / "));
             Serial.println(totalTracks);
 
-            myDFPlayer.playFolder(START_FOLDER, currentTrack);
+            myDFPlayer.playMp3Folder(currentTrack);
+            triggerLedBlink();
         }
+    }
+
+    // ── LED blink off ────────────────────────────────────────────────────────
+    if (ledOffMs > 0 && millis() >= ledOffMs) {
+        digitalWrite(LED_BUILTIN, LOW);
+        ledOffMs = 0;
     }
 
     // ── 3. Touch input — expand here when hardware is connected ──────────────
