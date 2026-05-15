@@ -1,0 +1,16 @@
+Act as an expert embedded C++ developer. Write an Arduino IDE compatible sketch for the Seeed Studio XIAO ESP32-S3 to control a DFPlayer Mini MP3 module.
+
+Hardware & Pinout Context:
+- Microcontroller: Seeed Studio XIAO ESP32-S3.
+- Audio Module: DFPlayer Mini.
+- UART Pins on XIAO: TX is GPIO 43 (Pin D6), RX is GPIO 44 (Pin D7).
+- Note: The DFPlayer RX connects to XIAO TX (GPIO 43), and DFPlayer TX connects to XIAO RX (GPIO 44). A 1kΩ resistor is used on the DFPlayer RX line.
+
+Requirements:
+1. Use the standard `DFRobotDFPlayerMini` library.
+2. Use `HardwareSerial(1)` for communication with the DFPlayer to leave the default Serial (USB) free for debugging.
+3. Initialize the debug Serial at 115200 baud and the DFPlayer Serial at 9600 baud.
+4. Implement robust error handling during initialization (e.g., check if the module responds, print clear troubleshooting steps to the serial monitor if it fails).
+5. Once initialized, set the volume to 15 and the EQ to normal.
+6. Trigger the playback of the first file in the "mp3" folder (Folder 15, Track 1).
+7. Ensure the code is clean, well-commented, and follows embedded C++ best practices. Add a non-blocking structure in the `loop()` where future inputs (like touch pins) could be handled.
